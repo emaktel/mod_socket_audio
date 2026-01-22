@@ -1,11 +1,11 @@
 /*
  * FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  *
- * mod_gemini_live.c -- Ultra-low-latency bidirectional audio streaming for Gemini Live API
+ * mod_socket_audio.c -- Ultra-low-latency bidirectional audio streaming via TCP socket
  *
  * This module provides a "dumb pipe" for audio between FreeSWITCH and an external
- * TCP socket. It is designed to integrate with Google's Gemini Multimodal Live API
- * via an external sidecar application controlled through ESL.
+ * TCP socket. It is designed for integration with external audio processing services
+ * (such as AI voice APIs) via a sidecar application controlled through ESL.
  *
  * Design Philosophy:
  * - Minimal latency: no buffering delays, immediate playback
@@ -16,23 +16,23 @@
 
 #include <switch.h>
 
-#define GEMINI_INPUT_RATE   16000   /* Send to Gemini at 16kHz */
-#define GEMINI_OUTPUT_RATE  24000   /* Receive from Gemini at 24kHz */
-#define GEMINI_BUG_NAME     "gemini_live"
-#define GEMINI_PRIVATE      "_gemini_live_"
+#define SOCKET_AUDIO_INPUT_RATE   16000   /* Input sample rate (to sidecar) */
+#define SOCKET_AUDIO_OUTPUT_RATE  24000   /* Output sample rate (from sidecar) */
+#define SOCKET_AUDIO_BUG_NAME     "socket_audio"
+#define SOCKET_AUDIO_PRIVATE      "_socket_audio_"
 
 /* Maximum audio queue size: 90 seconds at 48kHz (worst case session rate)
- * Gemini may generate audio faster than real-time, so queue must hold entire turn.
+ * Sidecar may generate audio faster than real-time, so queue must hold entire turn.
  * Memory: ~8.6MB at 48kHz, ~2.9MB at 16kHz, ~1.4MB at 8kHz per call */
-#define GEMINI_QUEUE_MAX_SIZE  (48000 * 2 * 90)
+#define SOCKET_AUDIO_QUEUE_MAX_SIZE  (48000 * 2 * 90)
 
 /* Duration to discard incoming audio after flush (microseconds)
  * This allows in-flight packets to clear before resuming playback */
-#define GEMINI_DISCARD_DURATION_US  500000  /* 500ms */
+#define SOCKET_AUDIO_DISCARD_DURATION_US  50000  /* 50ms */
 
-SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_gemini_live_shutdown);
-SWITCH_MODULE_LOAD_FUNCTION(mod_gemini_live_load);
-SWITCH_MODULE_DEFINITION(mod_gemini_live, mod_gemini_live_load, mod_gemini_live_shutdown, NULL);
+SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_socket_audio_shutdown);
+SWITCH_MODULE_LOAD_FUNCTION(mod_socket_audio_load);
+SWITCH_MODULE_DEFINITION(mod_socket_audio, mod_socket_audio_load, mod_socket_audio_shutdown, NULL);
 
 typedef struct {
     /* Session reference */
@@ -49,14 +49,15 @@ typedef struct {
     switch_mutex_t *mutex;
     volatile uint8_t running;
 
-    /* Inbound audio queue (from Gemini, waiting to play) */
+    /* Inbound audio queue (from sidecar, waiting to play) */
     switch_buffer_t *audio_queue;
     volatile uint8_t flush_flag;
     switch_time_t discard_until;  /* Discard incoming audio until this timestamp (microseconds) */
+    volatile uint8_t is_playing;  /* Track if we're currently playing audio (for events) */
 
     /* Resamplers */
-    switch_audio_resampler_t *read_resampler;   /* session → 16kHz (to Gemini) */
-    switch_audio_resampler_t *write_resampler;  /* 24kHz → session (from Gemini) */
+    switch_audio_resampler_t *read_resampler;   /* session → 16kHz (to sidecar) */
+    switch_audio_resampler_t *write_resampler;  /* 24kHz → session (from sidecar) */
 
     /* Session codec info */
     uint32_t session_rate;
@@ -65,19 +66,19 @@ typedef struct {
 
     /* Frame sizes in bytes (16-bit samples) */
     uint32_t session_frame_bytes;    /* Bytes per frame at session rate */
-    uint32_t gemini_in_frame_bytes;  /* Bytes per frame at 16kHz */
-    uint32_t gemini_out_frame_bytes; /* Bytes per frame at 24kHz */
+    uint32_t input_frame_bytes;  /* Bytes per frame at 16kHz */
+    uint32_t output_frame_bytes; /* Bytes per frame at 24kHz */
 
     /* Write codec for direct frame injection */
     switch_codec_t write_codec;
     switch_frame_t write_frame;
     uint8_t write_frame_data[SWITCH_RECOMMENDED_BUFFER_SIZE];
 
-} gemini_ctx_t;
+} socket_audio_ctx_t;
 
 /* Forward declarations */
-static switch_bool_t gemini_media_callback(switch_media_bug_t *bug, void *user_data, switch_abc_type_t type);
-static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, void *obj);
+static switch_bool_t socket_audio_media_callback(switch_media_bug_t *bug, void *user_data, switch_abc_type_t type);
+static void *SWITCH_THREAD_FUNC socket_audio_thread(switch_thread_t *thread, void *obj);
 
 /*
  * Socket Reader Thread
@@ -85,15 +86,15 @@ static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, vo
  * Runs in background, receives raw PCM from sidecar, pushes to queue.
  * Exits when socket closes or channel hangs up.
  */
-static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, void *obj)
+static void *SWITCH_THREAD_FUNC socket_audio_thread(switch_thread_t *thread, void *obj)
 {
-    gemini_ctx_t *ctx = (gemini_ctx_t *)obj;
+    socket_audio_ctx_t *ctx = (socket_audio_ctx_t *)obj;
     uint8_t recv_buf[8192];
     switch_size_t recv_len;
     switch_status_t status;
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
-                      "Gemini socket thread started\n");
+                      "Socket audio thread started\n");
 
     while (ctx->running && switch_channel_ready(ctx->channel)) {
         recv_len = sizeof(recv_buf);
@@ -102,12 +103,12 @@ static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, vo
         if (status != SWITCH_STATUS_SUCCESS || recv_len == 0) {
             /* Socket closed or error */
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
-                              "Gemini socket closed or error (status=%d, len=%zu)\n",
+                              "Socket closed or error (status=%d, len=%zu)\n",
                               status, recv_len);
             break;
         }
 
-        /* Received raw 24kHz PCM from Gemini via sidecar */
+        /* Received raw 24kHz PCM from sidecar */
         if (recv_len > 0) {
             int16_t *pcm_in = (int16_t *)recv_buf;
             uint32_t samples_in = recv_len / sizeof(int16_t);
@@ -128,11 +129,25 @@ static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, vo
                 flushed_bytes = switch_buffer_inuse(ctx->audio_queue);
                 switch_buffer_zero(ctx->audio_queue);
                 ctx->flush_flag = 0;
-                ctx->discard_until = switch_time_now() + GEMINI_DISCARD_DURATION_US;
+                ctx->discard_until = switch_time_now() + SOCKET_AUDIO_DISCARD_DURATION_US;
                 switch_mutex_unlock(ctx->mutex);
+
+                /* Fire playback_stop event if we were playing */
+                if (ctx->is_playing) {
+                    switch_event_t *event;
+                    ctx->is_playing = 0;
+                    if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "socket_audio::playback_stop") == SWITCH_STATUS_SUCCESS) {
+                        switch_channel_event_set_data(ctx->channel, event);
+                        switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Playback-Stop-Reason", "flush");
+                        switch_event_fire(&event);
+                    }
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
+                                      "Socket audio playback stopped (flush)\n");
+                }
+
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
-                                  "Gemini interrupted: flushed %zu bytes, discarding for %dms\n",
-                                  flushed_bytes, GEMINI_DISCARD_DURATION_US / 1000);
+                                  "Audio interrupted: flushed %zu bytes, discarding for %dms\n",
+                                  flushed_bytes, SOCKET_AUDIO_DISCARD_DURATION_US / 1000);
                 continue;
             }
 
@@ -142,14 +157,14 @@ static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, vo
             } else if (ctx->discard_until > 0) {
                 /* Discard window expired, resume normal operation */
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
-                                  "Gemini audio resumed after discard window\n");
+                                  "Audio resumed after discard window\n");
                 ctx->discard_until = 0;
             }
 
             /* Push resampled audio to queue */
             switch_mutex_lock(ctx->mutex);
-            if (switch_buffer_inuse(ctx->audio_queue) + bytes_out > GEMINI_QUEUE_MAX_SIZE) {
-                switch_size_t excess = (switch_buffer_inuse(ctx->audio_queue) + bytes_out) - GEMINI_QUEUE_MAX_SIZE;
+            if (switch_buffer_inuse(ctx->audio_queue) + bytes_out > SOCKET_AUDIO_QUEUE_MAX_SIZE) {
+                switch_size_t excess = (switch_buffer_inuse(ctx->audio_queue) + bytes_out) - SOCKET_AUDIO_QUEUE_MAX_SIZE;
                 switch_buffer_toss(ctx->audio_queue, excess);
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_WARNING,
                     "Queue overflow, dropped %zu bytes\n", excess);
@@ -161,6 +176,24 @@ static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, vo
             while (switch_channel_ready(ctx->channel) && ctx->running) {
                 switch_size_t queue_bytes;
 
+                /* Check if we're starting playback (transition from not playing to playing) */
+                if (!ctx->is_playing) {
+                    switch_mutex_lock(ctx->mutex);
+                    queue_bytes = switch_buffer_inuse(ctx->audio_queue);
+                    switch_mutex_unlock(ctx->mutex);
+
+                    if (queue_bytes >= ctx->session_frame_bytes) {
+                        switch_event_t *event;
+                        ctx->is_playing = 1;
+                        if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "socket_audio::playback_start") == SWITCH_STATUS_SUCCESS) {
+                            switch_channel_event_set_data(ctx->channel, event);
+                            switch_event_fire(&event);
+                        }
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
+                                          "Socket audio playback started\n");
+                    }
+                }
+
                 /* Check for flush flag - interrupt playback immediately */
                 if (ctx->flush_flag) {
                     switch_size_t flushed_bytes;
@@ -168,11 +201,25 @@ static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, vo
                     flushed_bytes = switch_buffer_inuse(ctx->audio_queue);
                     switch_buffer_zero(ctx->audio_queue);
                     ctx->flush_flag = 0;
-                    ctx->discard_until = switch_time_now() + GEMINI_DISCARD_DURATION_US;
+                    ctx->discard_until = switch_time_now() + SOCKET_AUDIO_DISCARD_DURATION_US;
                     switch_mutex_unlock(ctx->mutex);
+
+                    /* Fire playback_stop event if we were playing */
+                    if (ctx->is_playing) {
+                        switch_event_t *event;
+                        ctx->is_playing = 0;
+                        if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "socket_audio::playback_stop") == SWITCH_STATUS_SUCCESS) {
+                            switch_channel_event_set_data(ctx->channel, event);
+                            switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Playback-Stop-Reason", "flush");
+                            switch_event_fire(&event);
+                        }
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
+                                          "Socket audio playback stopped (flush)\n");
+                    }
+
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
-                                      "Gemini interrupted: flushed %zu bytes, discarding for %dms\n",
-                                      flushed_bytes, GEMINI_DISCARD_DURATION_US / 1000);
+                                      "Audio interrupted: flushed %zu bytes, discarding for %dms\n",
+                                      flushed_bytes, SOCKET_AUDIO_DISCARD_DURATION_US / 1000);
                     break;
                 }
 
@@ -181,6 +228,20 @@ static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, vo
 
                 if (queue_bytes < ctx->session_frame_bytes) {
                     switch_mutex_unlock(ctx->mutex);
+
+                    /* Fire playback_stop event if we were playing and queue is now empty */
+                    if (ctx->is_playing && queue_bytes == 0) {
+                        switch_event_t *event;
+                        ctx->is_playing = 0;
+                        if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "socket_audio::playback_stop") == SWITCH_STATUS_SUCCESS) {
+                            switch_channel_event_set_data(ctx->channel, event);
+                            switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Playback-Stop-Reason", "complete");
+                            switch_event_fire(&event);
+                        }
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
+                                          "Socket audio playback stopped (complete)\n");
+                    }
+
                     break; /* Not enough data for a full frame, wait for more */
                 }
 
@@ -208,7 +269,7 @@ static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, vo
     ctx->running = 0;
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
-                      "Gemini socket thread exiting\n");
+                      "Socket audio thread exiting\n");
 
     return NULL;
 }
@@ -219,9 +280,9 @@ static void *SWITCH_THREAD_FUNC gemini_socket_thread(switch_thread_t *thread, vo
  * Called by FreeSWITCH media thread every ptime (typically 20ms).
  * Must never block.
  */
-static switch_bool_t gemini_media_callback(switch_media_bug_t *bug, void *user_data, switch_abc_type_t type)
+static switch_bool_t socket_audio_media_callback(switch_media_bug_t *bug, void *user_data, switch_abc_type_t type)
 {
-    gemini_ctx_t *ctx = (gemini_ctx_t *)user_data;
+    socket_audio_ctx_t *ctx = (socket_audio_ctx_t *)user_data;
 
     if (!ctx) {
         return SWITCH_FALSE;
@@ -231,11 +292,11 @@ static switch_bool_t gemini_media_callback(switch_media_bug_t *bug, void *user_d
 
     case SWITCH_ABC_TYPE_INIT:
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
-                          "Gemini media bug initialized (session_rate=%u)\n", ctx->session_rate);
+                          "Socket audio initialized (session_rate=%u)\n", ctx->session_rate);
         break;
 
     case SWITCH_ABC_TYPE_READ_REPLACE:
-        /* MIC AUDIO: FreeSWITCH → Gemini (via sidecar) */
+        /* MIC AUDIO: FreeSWITCH → sidecar */
         {
             switch_frame_t *frame = switch_core_media_bug_get_read_replace_frame(bug);
             static int read_frame_log_count = 0;
@@ -304,19 +365,19 @@ static switch_bool_t gemini_media_callback(switch_media_bug_t *bug, void *user_d
 
     case SWITCH_ABC_TYPE_WRITE_REPLACE:
         /*
-         * SPEAKER AUDIO: Gemini → FreeSWITCH
+         * SPEAKER AUDIO: sidecar → FreeSWITCH
          * NOTE: We're NOT using WRITE_REPLACE for playback anymore.
          * The socket thread handles direct frame writing with proper pacing.
          * We keep this callback to handle flush requests only.
          */
         {
             switch_mutex_lock(ctx->mutex);
-            /* Check flush flag (set by uuid_gemini_flush API) */
+            /* Check flush flag (set by uuid_socket_audio_flush API) */
             if (ctx->flush_flag) {
                 switch_buffer_zero(ctx->audio_queue);
                 ctx->flush_flag = 0;
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_DEBUG,
-                                  "Gemini audio queue flushed\n");
+                                  "Audio queue flushed\n");
             }
             switch_mutex_unlock(ctx->mutex);
         }
@@ -324,7 +385,7 @@ static switch_bool_t gemini_media_callback(switch_media_bug_t *bug, void *user_d
 
     case SWITCH_ABC_TYPE_CLOSE:
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
-                          "Gemini media bug closing\n");
+                          "Socket audio closing\n");
 
         /* Signal thread to stop */
         ctx->running = 0;
@@ -362,17 +423,17 @@ static switch_bool_t gemini_media_callback(switch_media_bug_t *bug, void *user_d
 /*
  * Application Entry Point
  *
- * Called when ESL executes: execute gemini_live <host> <port>
+ * Called when ESL executes: execute socket_audio <host> <port>
  * Sets up socket, resamplers, thread, and media bug, then returns immediately.
  */
-SWITCH_STANDARD_APP(gemini_live_start)
+SWITCH_STANDARD_APP(socket_audio_start)
 {
     switch_channel_t *channel = switch_core_session_get_channel(session);
     switch_memory_pool_t *pool = switch_core_session_get_pool(session);
     switch_codec_implementation_t read_impl = { 0 };
     switch_sockaddr_t *sa = NULL;
     switch_threadattr_t *thd_attr = NULL;
-    gemini_ctx_t *ctx = NULL;
+    socket_audio_ctx_t *ctx = NULL;
     char *host = NULL;
     char *port_str = NULL;
     int port = 0;
@@ -383,7 +444,7 @@ SWITCH_STANDARD_APP(gemini_live_start)
     /* Parse arguments: <host> <port> */
     if (zstr(data)) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "Usage: gemini_live <host> <port>\n");
+                          "Usage: socket_audio <host> <port>\n");
         return;
     }
 
@@ -392,7 +453,7 @@ SWITCH_STANDARD_APP(gemini_live_start)
 
     if (argc != 2) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                          "Usage: gemini_live <host> <port>\n");
+                          "Usage: socket_audio <host> <port>\n");
         return;
     }
 
@@ -425,11 +486,11 @@ SWITCH_STANDARD_APP(gemini_live_start)
 
     /* Calculate frame sizes for 20ms ptime */
     ctx->session_frame_bytes = (ctx->session_rate / 1000) * ctx->read_ptime * sizeof(int16_t);
-    ctx->gemini_in_frame_bytes = (GEMINI_INPUT_RATE / 1000) * ctx->read_ptime * sizeof(int16_t);
-    ctx->gemini_out_frame_bytes = (GEMINI_OUTPUT_RATE / 1000) * ctx->read_ptime * sizeof(int16_t);
+    ctx->input_frame_bytes = (SOCKET_AUDIO_INPUT_RATE / 1000) * ctx->read_ptime * sizeof(int16_t);
+    ctx->output_frame_bytes = (SOCKET_AUDIO_OUTPUT_RATE / 1000) * ctx->read_ptime * sizeof(int16_t);
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                      "Gemini Live: session_rate=%u, ptime=%ums, frame_bytes=%u\n",
+                      "Socket audio: session_rate=%u, ptime=%ums, frame_bytes=%u\n",
                       ctx->session_rate, ctx->read_ptime, ctx->session_frame_bytes);
 
     /* Create mutex */
@@ -440,42 +501,42 @@ SWITCH_STANDARD_APP(gemini_live_start)
     }
 
     /* Create audio queue */
-    if (switch_buffer_create_dynamic(&ctx->audio_queue, 4096, 8192, GEMINI_QUEUE_MAX_SIZE) != SWITCH_STATUS_SUCCESS) {
+    if (switch_buffer_create_dynamic(&ctx->audio_queue, 4096, 8192, SOCKET_AUDIO_QUEUE_MAX_SIZE) != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "Failed to create audio queue\n");
         return;
     }
 
     /* Create resamplers if needed */
-    if (ctx->session_rate != GEMINI_INPUT_RATE) {
-        /* Session → 16kHz for sending to Gemini */
+    if (ctx->session_rate != SOCKET_AUDIO_INPUT_RATE) {
+        /* Session → 16kHz for sending to sidecar */
         if (switch_resample_create(&ctx->read_resampler,
                                    ctx->session_rate,
-                                   GEMINI_INPUT_RATE,
-                                   (uint32_t)(GEMINI_INPUT_RATE * 0.02 * 2), /* 20ms buffer */
+                                   SOCKET_AUDIO_INPUT_RATE,
+                                   (uint32_t)(SOCKET_AUDIO_INPUT_RATE * 0.02 * 2), /* 20ms buffer */
                                    SWITCH_RESAMPLE_QUALITY,
                                    1) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "Failed to create read resampler (%u → %u)\n",
-                              ctx->session_rate, GEMINI_INPUT_RATE);
+                              ctx->session_rate, SOCKET_AUDIO_INPUT_RATE);
             return;
         }
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                           "Created read resampler: %u → %u Hz\n",
-                          ctx->session_rate, GEMINI_INPUT_RATE);
+                          ctx->session_rate, SOCKET_AUDIO_INPUT_RATE);
     }
 
-    if (ctx->session_rate != GEMINI_OUTPUT_RATE) {
-        /* 24kHz → Session for receiving from Gemini */
+    if (ctx->session_rate != SOCKET_AUDIO_OUTPUT_RATE) {
+        /* 24kHz → Session for receiving from sidecar */
         if (switch_resample_create(&ctx->write_resampler,
-                                   GEMINI_OUTPUT_RATE,
+                                   SOCKET_AUDIO_OUTPUT_RATE,
                                    ctx->session_rate,
                                    (uint32_t)(ctx->session_rate * 0.02 * 2), /* 20ms buffer */
                                    SWITCH_RESAMPLE_QUALITY,
                                    1) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "Failed to create write resampler (%u → %u)\n",
-                              GEMINI_OUTPUT_RATE, ctx->session_rate);
+                              SOCKET_AUDIO_OUTPUT_RATE, ctx->session_rate);
             if (ctx->read_resampler) {
                 switch_resample_destroy(&ctx->read_resampler);
             }
@@ -483,7 +544,7 @@ SWITCH_STANDARD_APP(gemini_live_start)
         }
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                           "Created write resampler: %u → %u Hz\n",
-                          GEMINI_OUTPUT_RATE, ctx->session_rate);
+                          SOCKET_AUDIO_OUTPUT_RATE, ctx->session_rate);
     }
 
     /* Resolve host address */
@@ -512,7 +573,7 @@ SWITCH_STANDARD_APP(gemini_live_start)
     switch_socket_opt_set(ctx->sock, SWITCH_SO_TCP_NODELAY, 1);
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                      "Connected to Gemini sidecar at %s:%d\n", host, port);
+                      "Connected to sidecar at %s:%d\n", host, port);
 
     /* Initialize write codec for direct frame injection (L16 at session rate) */
     if (switch_core_codec_init(&ctx->write_codec,
@@ -544,7 +605,7 @@ SWITCH_STANDARD_APP(gemini_live_start)
     switch_threadattr_detach_set(thd_attr, 1);
     switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
 
-    if (switch_thread_create(&ctx->thread, thd_attr, gemini_socket_thread, ctx, pool) != SWITCH_STATUS_SUCCESS) {
+    if (switch_thread_create(&ctx->thread, thd_attr, socket_audio_thread, ctx, pool) != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                           "Failed to create socket thread\n");
         ctx->running = 0;
@@ -552,8 +613,8 @@ SWITCH_STANDARD_APP(gemini_live_start)
     }
 
     /* Attach media bug */
-    if (switch_core_media_bug_add(session, GEMINI_BUG_NAME, NULL,
-                                  gemini_media_callback, ctx, 0,
+    if (switch_core_media_bug_add(session, SOCKET_AUDIO_BUG_NAME, NULL,
+                                  socket_audio_media_callback, ctx, 0,
                                   SMBF_READ_REPLACE | SMBF_WRITE_REPLACE | SMBF_NO_PAUSE,
                                   &ctx->bug) != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -563,10 +624,10 @@ SWITCH_STANDARD_APP(gemini_live_start)
     }
 
     /* Store context in channel for API access */
-    switch_channel_set_private(channel, GEMINI_PRIVATE, ctx);
+    switch_channel_set_private(channel, SOCKET_AUDIO_PRIVATE, ctx);
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                      "Gemini Live audio pipe established\n");
+                      "Socket audio pipe established\n");
 
     return;
 
@@ -590,23 +651,23 @@ error:
 }
 
 /*
- * API: uuid_gemini_flush
+ * API: uuid_socket_audio_flush
  *
  * Flushes the audio queue for a session. Called by sidecar via ESL when
- * Gemini signals end-of-turn or interruption.
+ * signaling end-of-turn or interruption.
  *
- * Usage: uuid_gemini_flush <uuid>
+ * Usage: uuid_socket_audio_flush <uuid>
  */
-SWITCH_STANDARD_API(uuid_gemini_flush_function)
+SWITCH_STANDARD_API(uuid_socket_audio_flush_function)
 {
     switch_core_session_t *target_session = NULL;
     switch_channel_t *channel = NULL;
-    gemini_ctx_t *ctx = NULL;
+    socket_audio_ctx_t *ctx = NULL;
     char *uuid = NULL;
     char *mycmd = NULL;
 
     if (zstr(cmd)) {
-        stream->write_function(stream, "-ERR Usage: uuid_gemini_flush <uuid>\n");
+        stream->write_function(stream, "-ERR Usage: uuid_socket_audio_flush <uuid>\n");
         return SWITCH_STATUS_SUCCESS;
     }
 
@@ -635,10 +696,10 @@ SWITCH_STANDARD_API(uuid_gemini_flush_function)
     }
 
     channel = switch_core_session_get_channel(target_session);
-    ctx = switch_channel_get_private(channel, GEMINI_PRIVATE);
+    ctx = switch_channel_get_private(channel, SOCKET_AUDIO_PRIVATE);
 
     if (!ctx) {
-        stream->write_function(stream, "-ERR Gemini not active on session: %s\n", uuid);
+        stream->write_function(stream, "-ERR Socket audio not active on session: %s\n", uuid);
         switch_core_session_rwunlock(target_session);
         free(mycmd);
         return SWITCH_STATUS_SUCCESS;
@@ -650,7 +711,7 @@ SWITCH_STANDARD_API(uuid_gemini_flush_function)
     switch_mutex_unlock(ctx->mutex);
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(target_session), SWITCH_LOG_INFO,
-                      "Gemini flush requested\n");
+                      "Flush requested\n");
 
     stream->write_function(stream, "+OK\n");
 
@@ -660,22 +721,22 @@ SWITCH_STANDARD_API(uuid_gemini_flush_function)
 }
 
 /*
- * API: uuid_gemini_stop
+ * API: uuid_socket_audio_stop
  *
- * Stops the Gemini audio pipe for a session.
+ * Stops the socket audio pipe for a session.
  *
- * Usage: uuid_gemini_stop <uuid>
+ * Usage: uuid_socket_audio_stop <uuid>
  */
-SWITCH_STANDARD_API(uuid_gemini_stop_function)
+SWITCH_STANDARD_API(uuid_socket_audio_stop_function)
 {
     switch_core_session_t *target_session = NULL;
     switch_channel_t *channel = NULL;
-    gemini_ctx_t *ctx = NULL;
+    socket_audio_ctx_t *ctx = NULL;
     char *uuid = NULL;
     char *mycmd = NULL;
 
     if (zstr(cmd)) {
-        stream->write_function(stream, "-ERR Usage: uuid_gemini_stop <uuid>\n");
+        stream->write_function(stream, "-ERR Usage: uuid_socket_audio_stop <uuid>\n");
         return SWITCH_STATUS_SUCCESS;
     }
 
@@ -704,10 +765,10 @@ SWITCH_STANDARD_API(uuid_gemini_stop_function)
     }
 
     channel = switch_core_session_get_channel(target_session);
-    ctx = switch_channel_get_private(channel, GEMINI_PRIVATE);
+    ctx = switch_channel_get_private(channel, SOCKET_AUDIO_PRIVATE);
 
     if (!ctx) {
-        stream->write_function(stream, "-ERR Gemini not active on session: %s\n", uuid);
+        stream->write_function(stream, "-ERR Socket audio not active on session: %s\n", uuid);
         switch_core_session_rwunlock(target_session);
         free(mycmd);
         return SWITCH_STATUS_SUCCESS;
@@ -718,10 +779,10 @@ SWITCH_STANDARD_API(uuid_gemini_stop_function)
         switch_core_media_bug_remove(target_session, &ctx->bug);
     }
 
-    switch_channel_set_private(channel, GEMINI_PRIVATE, NULL);
+    switch_channel_set_private(channel, SOCKET_AUDIO_PRIVATE, NULL);
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(target_session), SWITCH_LOG_INFO,
-                      "Gemini stopped\n");
+                      "Socket audio stopped\n");
 
     stream->write_function(stream, "+OK\n");
 
@@ -733,7 +794,7 @@ SWITCH_STANDARD_API(uuid_gemini_stop_function)
 /*
  * Module Load
  */
-SWITCH_MODULE_LOAD_FUNCTION(mod_gemini_live_load)
+SWITCH_MODULE_LOAD_FUNCTION(mod_socket_audio_load)
 {
     switch_application_interface_t *app_interface;
     switch_api_interface_t *api_interface;
@@ -741,26 +802,26 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_gemini_live_load)
     *module_interface = switch_loadable_module_create_module_interface(pool, modname);
 
     /* Register application */
-    SWITCH_ADD_APP(app_interface, "gemini_live",
-                   "Gemini Live Audio Pipe",
-                   "Ultra-low-latency bidirectional audio streaming for Gemini Live API",
-                   gemini_live_start,
+    SWITCH_ADD_APP(app_interface, "socket_audio",
+                   "Socket Audio Pipe",
+                   "Ultra-low-latency bidirectional audio streaming via TCP socket",
+                   socket_audio_start,
                    "<host> <port>",
                    SAF_MEDIA_TAP);
 
     /* Register API commands */
-    SWITCH_ADD_API(api_interface, "uuid_gemini_flush",
-                   "Flush Gemini audio queue (auto-resumes after 500ms)",
-                   uuid_gemini_flush_function,
+    SWITCH_ADD_API(api_interface, "uuid_socket_audio_flush",
+                   "Flush socket audio queue (auto-resumes after 50ms)",
+                   uuid_socket_audio_flush_function,
                    "<uuid>");
 
-    SWITCH_ADD_API(api_interface, "uuid_gemini_stop",
-                   "Stop Gemini audio pipe",
-                   uuid_gemini_stop_function,
+    SWITCH_ADD_API(api_interface, "uuid_socket_audio_stop",
+                   "Stop socket audio pipe",
+                   uuid_socket_audio_stop_function,
                    "<uuid>");
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-                      "mod_gemini_live loaded\n");
+                      "mod_socket_audio loaded\n");
 
     return SWITCH_STATUS_SUCCESS;
 }
@@ -768,10 +829,10 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_gemini_live_load)
 /*
  * Module Shutdown
  */
-SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_gemini_live_shutdown)
+SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_socket_audio_shutdown)
 {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-                      "mod_gemini_live unloaded\n");
+                      "mod_socket_audio unloaded\n");
 
     return SWITCH_STATUS_SUCCESS;
 }

@@ -1,7 +1,7 @@
-# Makefile for mod_gemini_live
+# Makefile for mod_socket_audio
 # Standalone build without full FreeSWITCH source tree
 
-MODULE_NAME = mod_gemini_live
+MODULE_NAME = mod_socket_audio
 MODULE_SO = $(MODULE_NAME).so
 
 # FreeSWITCH paths
@@ -16,7 +16,7 @@ LDFLAGS = -shared
 LIBS = $(shell pkg-config --libs freeswitch 2>/dev/null || echo "-lfreeswitch")
 
 # Source files
-SRCS = mod_gemini_live.c
+SRCS = mod_socket_audio.c
 OBJS = $(SRCS:.c=.o)
 
 .PHONY: all clean install uninstall reload
@@ -38,10 +38,10 @@ install: $(MODULE_SO)
 	@echo "Installed $(MODULE_SO) to $(FS_MOD_DIR)"
 	@echo ""
 	@echo "To load the module, run in fs_cli:"
-	@echo "  load mod_gemini_live"
+	@echo "  load mod_socket_audio"
 	@echo ""
 	@echo "Or add to modules.conf.xml:"
-	@echo "  <load module=\"mod_gemini_live\"/>"
+	@echo "  <load module=\"mod_socket_audio\"/>"
 	@echo ""
 
 uninstall:
@@ -51,6 +51,6 @@ uninstall:
 # Reload module in running FreeSWITCH (useful during development)
 reload: install
 	@echo "Reloading module in FreeSWITCH..."
-	fs_cli -x "reload mod_gemini_live" 2>/dev/null || \
-	fs_cli -x "load mod_gemini_live" 2>/dev/null || \
+	fs_cli -x "reload mod_socket_audio" 2>/dev/null || \
+	fs_cli -x "load mod_socket_audio" 2>/dev/null || \
 	echo "Note: Could not reload. Start FreeSWITCH and load manually."
