@@ -229,20 +229,95 @@ static void *SWITCH_THREAD_FUNC socket_audio_thread(switch_thread_t *thread, voi
                 if (queue_bytes < ctx->session_frame_bytes) {
                     switch_mutex_unlock(ctx->mutex);
 
-                    /* Fire playback_stop event if we were playing and queue is now empty */
-                    if (ctx->is_playing && queue_bytes == 0) {
-                        switch_event_t *event;
-                        ctx->is_playing = 0;
-                        if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "socket_audio::playback_stop") == SWITCH_STATUS_SUCCESS) {
-                            switch_channel_event_set_data(ctx->channel, event);
-                            switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Playback-Stop-Reason", "complete");
-                            switch_event_fire(&event);
+                    /*
+                     * Queue is low - before deciding playback is complete, check if
+                     * more data is waiting in the socket buffer. This allows packets
+                     * to accumulate during playback without treating each as a separate turn.
+                     */
+                    switch_socket_opt_set(ctx->sock, SWITCH_SO_NONBLOCK, 1);
+                    {
+                        switch_size_t nb_recv_len = sizeof(recv_buf);
+                        switch_status_t nb_status = switch_socket_recv(ctx->sock, (char *)recv_buf, &nb_recv_len);
+
+                        if (nb_status == SWITCH_STATUS_SUCCESS && nb_recv_len > 0) {
+                            /* More data arrived - add to queue and continue playback */
+                            int16_t *nb_pcm_in = (int16_t *)recv_buf;
+                            uint32_t nb_samples_in = nb_recv_len / sizeof(int16_t);
+                            void *nb_pcm_out = recv_buf;
+                            uint32_t nb_bytes_out = nb_recv_len;
+
+                            switch_socket_opt_set(ctx->sock, SWITCH_SO_NONBLOCK, 0);
+
+                            /* Resample 24kHz → session rate if needed */
+                            if (ctx->write_resampler) {
+                                switch_resample_process(ctx->write_resampler, nb_pcm_in, nb_samples_in);
+                                nb_pcm_out = ctx->write_resampler->to;
+                                nb_bytes_out = ctx->write_resampler->to_len * sizeof(int16_t);
+                            }
+
+                            /* Check flush flag before adding to queue */
+                            if (ctx->flush_flag) {
+                                continue; /* Let the flush handler at top of loop deal with it */
+                            }
+
+                            /* Check discard window */
+                            if (ctx->discard_until > 0 && switch_time_now() < ctx->discard_until) {
+                                continue; /* Discard this data */
+                            }
+
+                            /* Add to queue */
+                            switch_mutex_lock(ctx->mutex);
+                            switch_buffer_write(ctx->audio_queue, nb_pcm_out, nb_bytes_out);
+                            switch_mutex_unlock(ctx->mutex);
+
+                            continue; /* Continue playback loop with new data */
                         }
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
-                                          "Socket audio playback stopped (complete)\n");
+                    }
+                    switch_socket_opt_set(ctx->sock, SWITCH_SO_NONBLOCK, 0);
+
+                    /*
+                     * No more data waiting in socket - this is truly end of playback.
+                     * Pad any remaining audio with silence and fire playback_stop.
+                     */
+                    if (ctx->is_playing) {
+                        switch_mutex_lock(ctx->mutex);
+                        queue_bytes = switch_buffer_inuse(ctx->audio_queue);
+
+                        if (queue_bytes > 0) {
+                            /* Pad remaining audio with silence and send final frame */
+                            memset(ctx->write_frame_data, 0, ctx->session_frame_bytes);
+                            switch_buffer_read(ctx->audio_queue, ctx->write_frame_data, queue_bytes);
+                            switch_mutex_unlock(ctx->mutex);
+
+                            /* Set up and write the final padded frame */
+                            ctx->write_frame.data = ctx->write_frame_data;
+                            ctx->write_frame.datalen = ctx->session_frame_bytes;
+                            ctx->write_frame.samples = ctx->session_frame_bytes / sizeof(int16_t);
+                            switch_core_session_write_frame(ctx->session, &ctx->write_frame, SWITCH_IO_FLAG_NONE, 0);
+                            switch_yield(ctx->read_ptime * 1000);
+
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_DEBUG,
+                                              "Sent final frame with %zu bytes padded to %u bytes\n",
+                                              queue_bytes, ctx->session_frame_bytes);
+                        } else {
+                            switch_mutex_unlock(ctx->mutex);
+                        }
+
+                        /* Fire playback_stop event - queue is now fully drained */
+                        {
+                            switch_event_t *event;
+                            ctx->is_playing = 0;
+                            if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "socket_audio::playback_stop") == SWITCH_STATUS_SUCCESS) {
+                                switch_channel_event_set_data(ctx->channel, event);
+                                switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Playback-Stop-Reason", "complete");
+                                switch_event_fire(&event);
+                            }
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(ctx->session), SWITCH_LOG_INFO,
+                                              "Socket audio playback stopped (complete)\n");
+                        }
                     }
 
-                    break; /* Not enough data for a full frame, wait for more */
+                    break; /* Queue is empty and no more data waiting, exit playback loop */
                 }
 
                 /* Read one frame worth of data */
